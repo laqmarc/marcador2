@@ -65,6 +65,18 @@ struct TeamScore {
   int points;
 };
 
+enum class ScreenMode {
+  Home,
+  Match,
+};
+
+enum class SportId {
+  Padel,
+  Football,
+  Basketball,
+  Paret,
+};
+
 struct UiRect {
   int16_t x;
   int16_t y;
@@ -94,6 +106,12 @@ constexpr UiRect BTN_A_RECT{10, 196, 72, 34};
 constexpr UiRect BTN_UNDO_RECT{88, 196, 68, 34};
 constexpr UiRect BTN_TIMER_RECT{162, 196, 68, 34};
 constexpr UiRect BTN_B_RECT{236, 196, 72, 34};
+constexpr UiRect HOME_TITLE_RECT{10, 12, 300, 26};
+constexpr UiRect HOME_SUBTITLE_RECT{10, 38, 300, 18};
+constexpr UiRect HOME_PADEL_RECT{10, 62, 145, 64};
+constexpr UiRect HOME_FOOTBALL_RECT{165, 62, 145, 64};
+constexpr UiRect HOME_BASKET_RECT{10, 142, 145, 64};
+constexpr UiRect HOME_PARET_RECT{165, 142, 145, 64};
 
 TFT_eSPI tft = TFT_eSPI();
 SPIClass touchSpi(VSPI);
@@ -102,6 +120,8 @@ XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 Button scoreButton{SCORE_BUTTON_PIN, HIGH, HIGH, 0};
 TeamScore teamA{0, 0, 0};
 TeamScore teamB{0, 0, 0};
+ScreenMode currentScreen = ScreenMode::Home;
+SportId currentSport = SportId::Padel;
 
 bool singleClickPending = false;
 unsigned long lastButtonReleaseAt = 0;
@@ -127,6 +147,28 @@ BLECharacteristic *stateCharacteristic = nullptr;
 bool deviceConnected = false;
 bool restartAdvertising = false;
 
+const char *sportName() {
+  switch (currentSport) {
+    case SportId::Padel:
+      return "PADEL";
+    case SportId::Football:
+      return "FUTBOL";
+    case SportId::Basketball:
+      return "BASQUET";
+    case SportId::Paret:
+      return "PARET";
+  }
+  return "";
+}
+
+bool isPadelSport() {
+  return currentSport == SportId::Padel;
+}
+
+bool isParetSport() {
+  return currentSport == SportId::Paret;
+}
+
 bool contains(const UiRect &rect, int16_t x, int16_t y) {
   return x >= rect.x && x < rect.x + rect.w && y >= rect.y &&
          y < rect.y + rect.h;
@@ -137,15 +179,33 @@ bool isPressed(const Button &button) {
 }
 
 bool matchOver() {
-  return teamA.sets >= 2 || teamB.sets >= 2;
+  if (currentScreen != ScreenMode::Match) {
+    return false;
+  }
+
+  if (isPadelSport()) {
+    return teamA.sets >= 2 || teamB.sets >= 2;
+  }
+
+  if (isParetSport()) {
+    return teamA.points <= 0 || teamB.points <= 0;
+  }
+
+  return false;
 }
 
 bool inTieBreak() {
-  return !matchOver() && teamA.games == 6 && teamB.games == 6;
+  return currentScreen == ScreenMode::Match && isPadelSport() && !matchOver() &&
+         teamA.games == 6 && teamB.games == 6;
 }
 
 void setStatus(const char *message) {
   snprintf(statusLine, sizeof(statusLine), "%s", message);
+  uiDirty = true;
+}
+
+void clearStatus() {
+  statusLine[0] = '\0';
   uiDirty = true;
 }
 
@@ -173,7 +233,16 @@ String formatElapsedTime(unsigned long elapsedMs) {
 
 String pointLabel(const TeamScore &team, const TeamScore &other) {
   if (matchOver()) {
-    return team.sets > other.sets ? "WIN" : "--";
+    if (isPadelSport()) {
+      return team.sets > other.sets ? "WIN" : "--";
+    }
+    if (isParetSport()) {
+      return team.points > other.points ? "WIN" : "0";
+    }
+  }
+
+  if (!isPadelSport()) {
+    return String(team.points);
   }
 
   if (inTieBreak()) {
@@ -204,6 +273,9 @@ String pointLabel(const TeamScore &team, const TeamScore &other) {
 
 String statePayload() {
   String json = "{";
+  json += "\"sport\":\"";
+  json += sportName();
+  json += "\",";
   json += "\"teamAPoints\":\"";
   json += pointLabel(teamA, teamB);
   json += "\",\"teamAGames\":";
@@ -222,6 +294,19 @@ String statePayload() {
   json += matchOver() ? "true" : "false";
   json += "}";
   return json;
+}
+
+void goHome() {
+  currentScreen = ScreenMode::Home;
+  timerRunning = false;
+  timerAccumulatedMs = 0;
+  timerStartedAt = 0;
+  singleClickPending = false;
+  lastButtonReleaseAt = 0;
+  lastRenderedSecond = ~0UL;
+  timerDirty = false;
+  clearStatus();
+  uiDirty = true;
 }
 
 void copyGameLog(char *destination, const char *source) {
@@ -302,8 +387,39 @@ void resetMatch() {
   lastButtonReleaseAt = 0;
   lastRenderedSecond = ~0UL;
   timerDirty = true;
+
+  if (isParetSport()) {
+    teamA.points = 5;
+    teamB.points = 5;
+  }
+
   setStatus("Partit reiniciat");
   markDirty();
+}
+
+void startSport(SportId sport) {
+  currentSport = sport;
+  currentScreen = ScreenMode::Match;
+  resetMatch();
+
+  switch (sport) {
+    case SportId::Padel:
+      setStatus("Padel llest");
+      break;
+    case SportId::Football:
+      setStatus("Futbol llest");
+      break;
+    case SportId::Basketball:
+      setStatus("Basquet llest");
+      break;
+    case SportId::Paret:
+      setStatus("Paret llest");
+      break;
+  }
+
+  lastRenderedSecond = ~0UL;
+  timerDirty = true;
+  uiDirty = true;
 }
 
 void recordSetResult() {
@@ -383,12 +499,44 @@ void awardPoint(TeamScore &winner, TeamScore &loser, char winnerCode) {
 
 void handlePointA() {
   saveUndoState();
-  awardPoint(teamA, teamB, 'A');
+  if (isPadelSport()) {
+    awardPoint(teamA, teamB, 'A');
+    return;
+  }
+
+  if (isParetSport()) {
+    if (teamA.points > 0) {
+      teamA.points--;
+    }
+    setStatus(teamA.points <= 0 ? "Perd A" : "Vida -A");
+    markDirty();
+    return;
+  }
+
+  teamA.points++;
+  setStatus(currentSport == SportId::Football ? "Gol A" : "Punts A");
+  markDirty();
 }
 
 void handlePointB() {
   saveUndoState();
-  awardPoint(teamB, teamA, 'B');
+  if (isPadelSport()) {
+    awardPoint(teamB, teamA, 'B');
+    return;
+  }
+
+  if (isParetSport()) {
+    if (teamB.points > 0) {
+      teamB.points--;
+    }
+    setStatus(teamB.points <= 0 ? "Perd B" : "Vida -B");
+    markDirty();
+    return;
+  }
+
+  teamB.points++;
+  setStatus(currentSport == SportId::Football ? "Gol B" : "Punts B");
+  markDirty();
 }
 
 void toggleTimer() {
@@ -479,6 +627,19 @@ bool mapTouchToScreen(int16_t &screenX, int16_t &screenY) {
 }
 
 void handleTouchAction(int16_t screenX, int16_t screenY) {
+  if (currentScreen == ScreenMode::Home) {
+    if (contains(HOME_PADEL_RECT, screenX, screenY)) {
+      startSport(SportId::Padel);
+    } else if (contains(HOME_FOOTBALL_RECT, screenX, screenY)) {
+      startSport(SportId::Football);
+    } else if (contains(HOME_BASKET_RECT, screenX, screenY)) {
+      startSport(SportId::Basketball);
+    } else if (contains(HOME_PARET_RECT, screenX, screenY)) {
+      startSport(SportId::Paret);
+    }
+    return;
+  }
+
   if (contains(TIMER_RECT, screenX, screenY) ||
       contains(BTN_TIMER_RECT, screenX, screenY)) {
     toggleTimer();
@@ -493,6 +654,11 @@ void handleTouchAction(int16_t screenX, int16_t screenY) {
   if (contains(STATUS_RECT, screenX, screenY)) {
     saveUndoState();
     resetMatch();
+    return;
+  }
+
+  if (contains(LOG_RECT, screenX, screenY)) {
+    goHome();
     return;
   }
 
@@ -584,6 +750,14 @@ void drawButton(const UiRect &rect, uint16_t fillColor, const String &label,
                    fillColor);
 }
 
+void drawSportTile(const UiRect &rect, uint16_t fillColor, const String &title,
+                   const String &subtitle) {
+  drawPill(rect, fillColor, COLOR_LINE);
+  drawCenteredText(rect.x + rect.w / 2, rect.y + 8, title, COLOR_BG, 2, fillColor);
+  drawCenteredText(rect.x + rect.w / 2, rect.y + 34, subtitle, COLOR_TEXT, 1,
+                   fillColor);
+}
+
 void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &pointValue,
                    int games, int sets, uint16_t accentColor) {
   const UiRect gamesRect{static_cast<int16_t>(rect.x + 14),
@@ -597,19 +771,33 @@ void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &poin
   drawCenteredText(rect.x + rect.w / 2, rect.y + 14, teamLabel, COLOR_BG, 2,
                    accentColor);
 
-  drawCenteredText(rect.x + rect.w / 2, rect.y + 48, pointValue, COLOR_TEXT, 4,
+  const int bigFont = pointValue.length() > 2 ? 2 : 4;
+  const int16_t bigValueY = 92;
+  const uint16_t pointColor = COLOR_TEXT;
+  drawCenteredText(rect.x + rect.w / 2, bigValueY, pointValue, pointColor, bigFont,
                    COLOR_PANEL);
 
-  tft.fillRoundRect(gamesRect.x, gamesRect.y, gamesRect.w, gamesRect.h, 8,
+  if (isPadelSport()) {
+    tft.fillRoundRect(gamesRect.x, gamesRect.y, gamesRect.w, gamesRect.h, 8,
+                      COLOR_PANEL_ALT);
+    drawCenteredText(gamesRect.x + 28, gamesRect.y + 3, "SETS", COLOR_MUTED, 1,
+                     COLOR_PANEL_ALT);
+    drawCenteredText(gamesRect.x + 28, gamesRect.y + 11, String(sets), COLOR_TEXT, 2,
+                     COLOR_PANEL_ALT);
+    drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 3, "JOCS",
+                     COLOR_MUTED, 1, COLOR_PANEL_ALT);
+    drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 11,
+                     String(games), COLOR_TEXT, 2, COLOR_PANEL_ALT);
+    return;
+  }
+
+  tft.fillRoundRect(gamesRect.x + 20, gamesRect.y, gamesRect.w - 40, gamesRect.h, 8,
                     COLOR_PANEL_ALT);
-  drawCenteredText(gamesRect.x + 28, gamesRect.y + 3, "SETS", COLOR_MUTED, 1,
-                   COLOR_PANEL_ALT);
-  drawCenteredText(gamesRect.x + 28, gamesRect.y + 11, String(sets), COLOR_TEXT, 2,
-                   COLOR_PANEL_ALT);
-  drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 3, "JOCS",
+  drawCenteredText(rect.x + rect.w / 2, gamesRect.y + 7,
+                   currentSport == SportId::Football
+                       ? "GOLS"
+                       : (currentSport == SportId::Paret ? "VIDES" : "PUNTS"),
                    COLOR_MUTED, 1, COLOR_PANEL_ALT);
-  drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 11,
-                   String(games), COLOR_TEXT, 2, COLOR_PANEL_ALT);
 }
 
 String setsSummary() {
@@ -630,6 +818,18 @@ String setsSummary() {
 }
 
 void drawMatchStrip() {
+  if (!isPadelSport()) {
+    tft.fillRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
+                      COLOR_PANEL);
+    tft.drawRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
+                      COLOR_LINE);
+    drawTextLine(LOG_RECT.x + 10, LOG_RECT.y + 11, sportName(), COLOR_TEXT, 1,
+                 COLOR_PANEL);
+    drawTextLine(LOG_RECT.x + 168, LOG_RECT.y + 11, "toca per canviar",
+                 COLOR_MUTED, 1, COLOR_PANEL);
+    return;
+  }
+
   tft.fillRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
                     COLOR_PANEL);
   tft.drawRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
@@ -658,6 +858,26 @@ void drawMatchStrip() {
                COLOR_MUTED, 1, COLOR_PANEL);
 }
 
+void renderHomeScreen() {
+  tft.startWrite();
+  tft.fillScreen(COLOR_BG);
+
+  drawCenteredText(HOME_TITLE_RECT.x + HOME_TITLE_RECT.w / 2, HOME_TITLE_RECT.y + 3,
+                   "TRIA ESPORT", COLOR_TEXT, 2, COLOR_BG);
+  drawCenteredText(HOME_SUBTITLE_RECT.x + HOME_SUBTITLE_RECT.w / 2,
+                   HOME_SUBTITLE_RECT.y + 2, "toca per obrir el marcador",
+                   COLOR_MUTED, 1, COLOR_BG);
+
+  drawSportTile(HOME_PADEL_RECT, COLOR_A, "PADEL", "punts, jocs i sets");
+  drawSportTile(HOME_FOOTBALL_RECT, COLOR_B, "FUTBOL", "marcador directe");
+  drawSportTile(HOME_BASKET_RECT, COLOR_TIMER, "BASQUET", "marcador directe");
+  drawSportTile(HOME_PARET_RECT, COLOR_SUCCESS, "PARET", "5 vides per costat");
+
+  tft.endWrite();
+  uiDirty = false;
+  timerDirty = false;
+}
+
 void drawTimerPanel() {
   drawPill(TIMER_RECT, timerRunning ? COLOR_TIMER : COLOR_PANEL_ALT, COLOR_TIMER);
   drawCenteredText(TIMER_RECT.x + TIMER_RECT.w / 2, TIMER_RECT.y + 6,
@@ -671,6 +891,11 @@ void renderDisplay() {
     return;
   }
 
+  if (currentScreen == ScreenMode::Home) {
+    renderHomeScreen();
+    return;
+  }
+
   tft.startWrite();
   tft.fillScreen(COLOR_BG);
 
@@ -681,9 +906,11 @@ void renderDisplay() {
   drawTimerPanel();
   drawStatusPanel();
 
-  drawScoreCard(CARD_A_RECT, "PARELLA A", pointLabel(teamA, teamB), teamA.games,
+  drawScoreCard(CARD_A_RECT, isPadelSport() ? "PARELLA A" : "EQUIP A",
+                pointLabel(teamA, teamB), teamA.games,
                 teamA.sets, COLOR_A);
-  drawScoreCard(CARD_B_RECT, "PARELLA B", pointLabel(teamB, teamA), teamB.games,
+  drawScoreCard(CARD_B_RECT, isPadelSport() ? "PARELLA B" : "EQUIP B",
+                pointLabel(teamB, teamA), teamB.games,
                 teamB.sets, COLOR_B);
 
   drawMatchStrip();
@@ -700,7 +927,7 @@ void renderDisplay() {
 }
 
 void renderTimerIfNeeded() {
-  if (!timerDirty || uiDirty) {
+  if (currentScreen != ScreenMode::Match || !timerDirty || uiDirty) {
     return;
   }
 
@@ -848,13 +1075,17 @@ void setup() {
 }
 
 void loop() {
-  updateScoreButton();
+  if (currentScreen == ScreenMode::Match) {
+    updateScoreButton();
+  }
   updateTouchInput();
 
-  const unsigned long currentSecond = elapsedTimeMs() / 1000UL;
-  if (currentSecond != lastRenderedSecond) {
-    lastRenderedSecond = currentSecond;
-    timerDirty = true;
+  if (currentScreen == ScreenMode::Match) {
+    const unsigned long currentSecond = elapsedTimeMs() / 1000UL;
+    if (currentSecond != lastRenderedSecond) {
+      lastRenderedSecond = currentSecond;
+      timerDirty = true;
+    }
   }
 
   publishState();
