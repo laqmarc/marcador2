@@ -18,6 +18,7 @@ constexpr char DEVICE_NAME[] = "MarcadorPadel-BLE";
 constexpr char SERVICE_UUID[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char STATE_UUID[] = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 constexpr char COMMAND_UUID[] = "e3223119-9445-4e96-a4a1-85358c4046a2";
+constexpr bool ENABLE_BLE = false;
 
 constexpr uint8_t TFT_BACKLIGHT_PIN = 21;
 constexpr uint8_t TOUCH_CS = 33;
@@ -49,6 +50,7 @@ constexpr uint16_t COLOR_WARNING = 0xF2A6;
 constexpr uint16_t COLOR_DANGER = 0xE186;
 
 constexpr uint8_t MAX_GAME_LOG = 10;
+constexpr uint8_t MAX_SET_HISTORY = 3;
 
 struct Button {
   uint8_t pin;
@@ -58,6 +60,7 @@ struct Button {
 };
 
 struct TeamScore {
+  int sets;
   int games;
   int points;
 };
@@ -76,11 +79,14 @@ struct MatchSnapshot {
   unsigned long elapsedMs;
   uint8_t gameLogCount;
   char gameLog[MAX_GAME_LOG];
+  uint8_t setHistoryCount;
+  uint8_t setScoresA[MAX_SET_HISTORY];
+  uint8_t setScoresB[MAX_SET_HISTORY];
 };
 
-constexpr UiRect TIMER_RECT{96, 8, 128, 26};
+constexpr UiRect TIMER_RECT{98, 8, 110, 26};
 constexpr UiRect STATUS_RECT{10, 8, 76, 26};
-constexpr UiRect BLE_RECT{236, 8, 74, 26};
+constexpr UiRect STATUS_MSG_RECT{214, 8, 96, 26};
 constexpr UiRect CARD_A_RECT{10, 44, 146, 108};
 constexpr UiRect CARD_B_RECT{164, 44, 146, 108};
 constexpr UiRect LOG_RECT{10, 158, 300, 30};
@@ -94,8 +100,8 @@ SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 
 Button scoreButton{SCORE_BUTTON_PIN, HIGH, HIGH, 0};
-TeamScore teamA{0, 0};
-TeamScore teamB{0, 0};
+TeamScore teamA{0, 0, 0};
+TeamScore teamB{0, 0, 0};
 
 bool singleClickPending = false;
 unsigned long lastButtonReleaseAt = 0;
@@ -112,7 +118,10 @@ bool hasUndo = false;
 MatchSnapshot undoSnapshot{};
 char gameLog[MAX_GAME_LOG] = {};
 uint8_t gameLogCount = 0;
-char statusLine[24] = "Puntua des del TFT";
+uint8_t setHistoryCount = 0;
+uint8_t setScoresA[MAX_SET_HISTORY] = {};
+uint8_t setScoresB[MAX_SET_HISTORY] = {};
+char statusLine[24] = "";
 
 BLECharacteristic *stateCharacteristic = nullptr;
 bool deviceConnected = false;
@@ -125,6 +134,14 @@ bool contains(const UiRect &rect, int16_t x, int16_t y) {
 
 bool isPressed(const Button &button) {
   return button.stableLevel == LOW;
+}
+
+bool matchOver() {
+  return teamA.sets >= 2 || teamB.sets >= 2;
+}
+
+bool inTieBreak() {
+  return !matchOver() && teamA.games == 6 && teamB.games == 6;
 }
 
 void setStatus(const char *message) {
@@ -154,7 +171,15 @@ String formatElapsedTime(unsigned long elapsedMs) {
   return String(buffer);
 }
 
-const char *pointLabel(const TeamScore &team, const TeamScore &other) {
+String pointLabel(const TeamScore &team, const TeamScore &other) {
+  if (matchOver()) {
+    return team.sets > other.sets ? "WIN" : "--";
+  }
+
+  if (inTieBreak()) {
+    return String(team.points);
+  }
+
   if (team.points >= 3 && other.points >= 3) {
     if (team.points == other.points) {
       return "40";
@@ -183,10 +208,18 @@ String statePayload() {
   json += pointLabel(teamA, teamB);
   json += "\",\"teamAGames\":";
   json += teamA.games;
+  json += ",\"teamASets\":";
+  json += teamA.sets;
   json += ",\"teamBPoints\":\"";
   json += pointLabel(teamB, teamA);
   json += "\",\"teamBGames\":";
   json += teamB.games;
+  json += ",\"teamBSets\":";
+  json += teamB.sets;
+  json += ",\"tieBreak\":";
+  json += inTieBreak() ? "true" : "false";
+  json += ",\"matchOver\":";
+  json += matchOver() ? "true" : "false";
   json += "}";
   return json;
 }
@@ -202,6 +235,9 @@ void captureSnapshot(MatchSnapshot &snapshot) {
   snapshot.elapsedMs = elapsedTimeMs();
   snapshot.gameLogCount = gameLogCount;
   copyGameLog(snapshot.gameLog, gameLog);
+  snapshot.setHistoryCount = setHistoryCount;
+  memcpy(snapshot.setScoresA, setScoresA, MAX_SET_HISTORY);
+  memcpy(snapshot.setScoresB, setScoresB, MAX_SET_HISTORY);
 }
 
 void saveUndoState() {
@@ -214,6 +250,9 @@ void restoreSnapshot(const MatchSnapshot &snapshot) {
   teamB = snapshot.teamB;
   gameLogCount = snapshot.gameLogCount;
   copyGameLog(gameLog, snapshot.gameLog);
+  setHistoryCount = snapshot.setHistoryCount;
+  memcpy(setScoresA, snapshot.setScoresA, MAX_SET_HISTORY);
+  memcpy(setScoresB, snapshot.setScoresB, MAX_SET_HISTORY);
 
   timerRunning = snapshot.timerRunning;
   timerAccumulatedMs = snapshot.elapsedMs;
@@ -241,11 +280,21 @@ void resetPoints() {
   teamB.points = 0;
 }
 
+void resetGamesAndPoints() {
+  teamA.games = 0;
+  teamA.points = 0;
+  teamB.games = 0;
+  teamB.points = 0;
+}
+
 void resetMatch() {
-  teamA = {0, 0};
-  teamB = {0, 0};
+  teamA = {0, 0, 0};
+  teamB = {0, 0, 0};
   gameLogCount = 0;
   memset(gameLog, 0, sizeof(gameLog));
+  setHistoryCount = 0;
+  memset(setScoresA, 0, sizeof(setScoresA));
+  memset(setScoresB, 0, sizeof(setScoresB));
   timerRunning = false;
   timerAccumulatedMs = 0;
   timerStartedAt = 0;
@@ -255,6 +304,35 @@ void resetMatch() {
   timerDirty = true;
   setStatus("Partit reiniciat");
   markDirty();
+}
+
+void recordSetResult() {
+  if (setHistoryCount >= MAX_SET_HISTORY) {
+    return;
+  }
+
+  setScoresA[setHistoryCount] = static_cast<uint8_t>(teamA.games);
+  setScoresB[setHistoryCount] = static_cast<uint8_t>(teamB.games);
+  setHistoryCount++;
+}
+
+void concludeSet(char winnerCode) {
+  recordSetResult();
+
+  if (winnerCode == 'A') {
+    teamA.sets++;
+    setStatus(teamA.sets >= 2 ? "Partit per A" : "Set per A");
+  } else {
+    teamB.sets++;
+    setStatus(teamB.sets >= 2 ? "Partit per B" : "Set per B");
+  }
+
+  resetPoints();
+
+  if (!matchOver()) {
+    teamA.games = 0;
+    teamB.games = 0;
+  }
 }
 
 void finishGame(char winnerCode) {
@@ -267,13 +345,34 @@ void finishGame(char winnerCode) {
   }
 
   pushGameLog(winnerCode);
+
+  if ((max(teamA.games, teamB.games) >= 6 &&
+       abs(teamA.games - teamB.games) >= 2) ||
+      (max(teamA.games, teamB.games) == 7 &&
+       min(teamA.games, teamB.games) == 6)) {
+    concludeSet(winnerCode);
+    return;
+  }
+
   resetPoints();
 }
 
 void awardPoint(TeamScore &winner, TeamScore &loser, char winnerCode) {
+  if (matchOver()) {
+    setStatus("Partit acabat");
+    uiDirty = true;
+    return;
+  }
+
   winner.points++;
 
-  if (winner.points >= 4 && (winner.points - loser.points) >= 2) {
+  if (inTieBreak()) {
+    if (winner.points >= 7 && (winner.points - loser.points) >= 2) {
+      finishGame(winnerCode);
+    } else {
+      setStatus(winnerCode == 'A' ? "TB punt A" : "TB punt B");
+    }
+  } else if (winner.points >= 4 && (winner.points - loser.points) >= 2) {
     finishGame(winnerCode);
   } else {
     setStatus(winnerCode == 'A' ? "Punt A" : "Punt B");
@@ -448,15 +547,45 @@ void drawPill(const UiRect &rect, uint16_t fillColor, uint16_t borderColor) {
   tft.drawRoundRect(rect.x, rect.y, rect.w, rect.h, 12, borderColor);
 }
 
+void drawStatusPanel() {
+  drawPill(STATUS_MSG_RECT, COLOR_PANEL_ALT, COLOR_LINE);
+
+  if (statusLine[0] == '\0') {
+    return;
+  }
+
+  String text(statusLine);
+  if (text.length() <= 14) {
+    drawCenteredText(STATUS_MSG_RECT.x + STATUS_MSG_RECT.w / 2, STATUS_MSG_RECT.y + 8,
+                     text, COLOR_TEXT, 1, COLOR_PANEL_ALT);
+    return;
+  }
+
+  int splitAt = text.lastIndexOf(' ', 14);
+  if (splitAt <= 0) {
+    splitAt = text.indexOf(' ', 14);
+  }
+  if (splitAt <= 0) {
+    splitAt = 14;
+  }
+
+  const String line1 = text.substring(0, splitAt);
+  const String line2 = text.substring(splitAt + 1);
+  drawCenteredText(STATUS_MSG_RECT.x + STATUS_MSG_RECT.w / 2, STATUS_MSG_RECT.y + 3,
+                   line1, COLOR_TEXT, 1, COLOR_PANEL_ALT);
+  drawCenteredText(STATUS_MSG_RECT.x + STATUS_MSG_RECT.w / 2, STATUS_MSG_RECT.y + 13,
+                   line2, COLOR_TEXT, 1, COLOR_PANEL_ALT);
+}
+
 void drawButton(const UiRect &rect, uint16_t fillColor, const String &label,
-                int font) {
+                int font, int16_t topOffset = 9) {
   drawPill(rect, fillColor, COLOR_LINE);
-  drawCenteredText(rect.x + rect.w / 2, rect.y + 9, label, COLOR_TEXT, font,
+  drawCenteredText(rect.x + rect.w / 2, rect.y + topOffset, label, COLOR_TEXT, font,
                    fillColor);
 }
 
 void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &pointValue,
-                   int games, uint16_t accentColor) {
+                   int games, int sets, uint16_t accentColor) {
   const UiRect gamesRect{static_cast<int16_t>(rect.x + 14),
                          static_cast<int16_t>(rect.y + rect.h - 28),
                          static_cast<int16_t>(rect.w - 28), 18};
@@ -473,42 +602,60 @@ void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &poin
 
   tft.fillRoundRect(gamesRect.x, gamesRect.y, gamesRect.w, gamesRect.h, 8,
                     COLOR_PANEL_ALT);
-  drawTextLine(gamesRect.x + 10, gamesRect.y + 4, "JOCS", COLOR_MUTED, 1,
-               COLOR_PANEL_ALT);
-  drawTextLine(gamesRect.x + gamesRect.w - 22, gamesRect.y + 2, String(games),
-               COLOR_TEXT, 2, COLOR_PANEL_ALT);
+  drawCenteredText(gamesRect.x + 28, gamesRect.y + 3, "SETS", COLOR_MUTED, 1,
+                   COLOR_PANEL_ALT);
+  drawCenteredText(gamesRect.x + 28, gamesRect.y + 11, String(sets), COLOR_TEXT, 2,
+                   COLOR_PANEL_ALT);
+  drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 3, "JOCS",
+                   COLOR_MUTED, 1, COLOR_PANEL_ALT);
+  drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 11,
+                   String(games), COLOR_TEXT, 2, COLOR_PANEL_ALT);
 }
 
-void drawGameLog() {
+String setsSummary() {
+  if (setHistoryCount == 0) {
+    return String(matchOver() ? "final" : "set 1 en joc");
+  }
+
+  String summary;
+  for (uint8_t i = 0; i < setHistoryCount; ++i) {
+    if (i > 0) {
+      summary += "  ";
+    }
+    summary += String(setScoresA[i]);
+    summary += "-";
+    summary += String(setScoresB[i]);
+  }
+  return summary;
+}
+
+void drawMatchStrip() {
   tft.fillRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
                     COLOR_PANEL);
   tft.drawRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
                     COLOR_LINE);
-  drawTextLine(LOG_RECT.x + 10, LOG_RECT.y + 3, "REGISTRE JOCS", COLOR_MUTED, 1,
+  drawTextLine(LOG_RECT.x + 10, LOG_RECT.y + 11, "SETS", COLOR_MUTED, 1,
+               COLOR_PANEL);
+  drawTextLine(LOG_RECT.x + 48, LOG_RECT.y + 11, setsSummary(), COLOR_TEXT, 1,
                COLOR_PANEL);
 
-  if (gameLogCount == 0) {
-    drawTextLine(LOG_RECT.x + 116, LOG_RECT.y + 10, "encara buit", COLOR_TEXT, 1,
+  if (matchOver()) {
+    const char *winner = teamA.sets > teamB.sets ? "GUANYA A" : "GUANYA B";
+    drawTextLine(LOG_RECT.x + 210, LOG_RECT.y + 11, winner, COLOR_SUCCESS, 1,
                  COLOR_PANEL);
     return;
   }
 
-  const int16_t chipWidth = 18;
-  const int16_t chipHeight = 14;
-  const int16_t chipGap = 6;
-  const int16_t maxVisible = 9;
-  const int startIndex = gameLogCount > maxVisible ? gameLogCount - maxVisible : 0;
-  int16_t chipX = LOG_RECT.x + 132;
-
-  for (int i = startIndex; i < gameLogCount; ++i) {
-    const char winner = gameLog[i];
-    const uint16_t chipColor = winner == 'A' ? COLOR_A : COLOR_B;
-    UiRect chip{chipX, static_cast<int16_t>(LOG_RECT.y + 8), chipWidth, chipHeight};
-    drawPill(chip, chipColor, chipColor);
-    drawCenteredText(chip.x + chip.w / 2, chip.y + 3, String(winner),
-                     COLOR_BG, 1, chipColor);
-    chipX += chipWidth + chipGap;
+  if (inTieBreak()) {
+    drawTextLine(LOG_RECT.x + 214, LOG_RECT.y + 11,
+                 "TB " + String(teamA.points) + "-" + String(teamB.points),
+                 COLOR_TIMER, 1, COLOR_PANEL);
+    return;
   }
+
+  drawTextLine(LOG_RECT.x + 204, LOG_RECT.y + 11,
+               String("set ") + String(setHistoryCount + 1),
+               COLOR_MUTED, 1, COLOR_PANEL);
 }
 
 void drawTimerPanel() {
@@ -528,32 +675,24 @@ void renderDisplay() {
   tft.fillScreen(COLOR_BG);
 
   drawPill(STATUS_RECT, COLOR_DANGER, COLOR_DANGER);
-  drawCenteredText(STATUS_RECT.x + STATUS_RECT.w / 2, STATUS_RECT.y + 8,
+  drawCenteredText(STATUS_RECT.x + STATUS_RECT.w / 2, STATUS_RECT.y + 10,
                    "RESET", COLOR_TEXT, 1, COLOR_DANGER);
 
   drawTimerPanel();
-
-  drawPill(BLE_RECT, deviceConnected ? COLOR_SUCCESS : COLOR_PANEL_ALT,
-           deviceConnected ? COLOR_SUCCESS : COLOR_LINE);
-  drawCenteredText(BLE_RECT.x + BLE_RECT.w / 2, BLE_RECT.y + 8,
-                   deviceConnected ? "BLE ON" : "BLE OFF",
-                   deviceConnected ? COLOR_BG : COLOR_TEXT, 1,
-                   deviceConnected ? COLOR_SUCCESS : COLOR_PANEL_ALT);
+  drawStatusPanel();
 
   drawScoreCard(CARD_A_RECT, "PARELLA A", pointLabel(teamA, teamB), teamA.games,
-                COLOR_A);
+                teamA.sets, COLOR_A);
   drawScoreCard(CARD_B_RECT, "PARELLA B", pointLabel(teamB, teamA), teamB.games,
-                COLOR_B);
+                teamB.sets, COLOR_B);
 
-  drawGameLog();
+  drawMatchStrip();
 
   drawButton(BTN_A_RECT, COLOR_A, "+A", 2);
-  drawButton(BTN_UNDO_RECT, COLOR_WARNING, "UNDO", 1);
+  drawButton(BTN_UNDO_RECT, COLOR_WARNING, "UNDO", 1, 13);
   drawButton(BTN_TIMER_RECT, timerRunning ? COLOR_TIMER : COLOR_PANEL_ALT,
-             timerRunning ? "PAUSA" : "TEMPS", 1);
+             timerRunning ? "PAUSA" : "TEMPS", 1, 13);
   drawButton(BTN_B_RECT, COLOR_B, "+B", 2);
-
-  drawTextLine(10, 184, statusLine, COLOR_MUTED, 1, COLOR_BG);
 
   tft.endWrite();
   uiDirty = false;
@@ -701,7 +840,9 @@ void setup() {
   pinMode(scoreButton.pin, INPUT_PULLUP);
 
   startDisplay();
-  startBle();
+  if (ENABLE_BLE) {
+    startBle();
+  }
   publishState();
   renderDisplay();
 }
@@ -720,7 +861,7 @@ void loop() {
   renderDisplay();
   renderTimerIfNeeded();
 
-  if (restartAdvertising) {
+  if (ENABLE_BLE && restartAdvertising) {
     BLEDevice::startAdvertising();
     restartAdvertising = false;
     Serial.println("BLE advertising restarted");
