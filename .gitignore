@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+android-app/.gradle
+android-app/local.properties
+android-app/**/build
+android-app/.idea
