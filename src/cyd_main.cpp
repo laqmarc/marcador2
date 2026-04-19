@@ -6,6 +6,8 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 
+#include <cstring>
+
 namespace {
 
 constexpr uint8_t SCORE_BUTTON_PIN = 0;
@@ -28,24 +30,25 @@ constexpr int TOUCH_X_MIN = 200;
 constexpr int TOUCH_X_MAX = 3800;
 constexpr int TOUCH_Y_MIN = 200;
 constexpr int TOUCH_Y_MAX = 3800;
-constexpr uint16_t TOUCH_DEBOUNCE_MS = 250;
+constexpr uint16_t TOUCH_DEBOUNCE_MS = 220;
 
 constexpr uint16_t SCREEN_WIDTH = 320;
 constexpr uint16_t SCREEN_HEIGHT = 240;
 
-constexpr uint16_t COLOR_BG = TFT_NAVY;
-constexpr uint16_t COLOR_PANEL = 0x18E3;
-constexpr uint16_t COLOR_LINE = 0x4228;
+constexpr uint16_t COLOR_BG = 0x08A2;
+constexpr uint16_t COLOR_PANEL = 0x1924;
+constexpr uint16_t COLOR_PANEL_ALT = 0x21C7;
+constexpr uint16_t COLOR_LINE = 0x4208;
 constexpr uint16_t COLOR_TEXT = TFT_WHITE;
-constexpr uint16_t COLOR_MUTED = 0x9CD3;
-constexpr uint16_t COLOR_A = 0xFD20;
-constexpr uint16_t COLOR_B = 0x867D;
-constexpr uint16_t COLOR_ACCENT = 0x4FEA;
-constexpr uint16_t COLOR_OFF = 0x2945;
+constexpr uint16_t COLOR_MUTED = 0xBDF7;
+constexpr uint16_t COLOR_A = 0xFC66;
+constexpr uint16_t COLOR_B = 0x055D;
+constexpr uint16_t COLOR_TIMER = 0xFD80;
+constexpr uint16_t COLOR_SUCCESS = 0x3E6A;
+constexpr uint16_t COLOR_WARNING = 0xF2A6;
+constexpr uint16_t COLOR_DANGER = 0xE186;
 
-TFT_eSPI tft = TFT_eSPI();
-SPIClass touchSpi(VSPI);
-XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+constexpr uint8_t MAX_GAME_LOG = 10;
 
 struct Button {
   uint8_t pin;
@@ -59,6 +62,37 @@ struct TeamScore {
   int points;
 };
 
+struct UiRect {
+  int16_t x;
+  int16_t y;
+  int16_t w;
+  int16_t h;
+};
+
+struct MatchSnapshot {
+  TeamScore teamA;
+  TeamScore teamB;
+  bool timerRunning;
+  unsigned long elapsedMs;
+  uint8_t gameLogCount;
+  char gameLog[MAX_GAME_LOG];
+};
+
+constexpr UiRect TIMER_RECT{96, 8, 128, 26};
+constexpr UiRect STATUS_RECT{10, 8, 76, 26};
+constexpr UiRect BLE_RECT{236, 8, 74, 26};
+constexpr UiRect CARD_A_RECT{10, 44, 146, 108};
+constexpr UiRect CARD_B_RECT{164, 44, 146, 108};
+constexpr UiRect LOG_RECT{10, 158, 300, 30};
+constexpr UiRect BTN_A_RECT{10, 196, 72, 34};
+constexpr UiRect BTN_UNDO_RECT{88, 196, 68, 34};
+constexpr UiRect BTN_TIMER_RECT{162, 196, 68, 34};
+constexpr UiRect BTN_B_RECT{236, 196, 72, 34};
+
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSpi(VSPI);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
 Button scoreButton{SCORE_BUTTON_PIN, HIGH, HIGH, 0};
 TeamScore teamA{0, 0};
 TeamScore teamB{0, 0};
@@ -69,18 +103,55 @@ bool uiDirty = true;
 bool stateDirty = true;
 bool touchHeld = false;
 unsigned long lastTouchAt = 0;
+bool timerRunning = false;
+unsigned long timerAccumulatedMs = 0;
+unsigned long timerStartedAt = 0;
+unsigned long lastRenderedSecond = ~0UL;
+bool timerDirty = true;
+bool hasUndo = false;
+MatchSnapshot undoSnapshot{};
+char gameLog[MAX_GAME_LOG] = {};
+uint8_t gameLogCount = 0;
+char statusLine[24] = "Puntua des del TFT";
 
 BLECharacteristic *stateCharacteristic = nullptr;
 bool deviceConnected = false;
 bool restartAdvertising = false;
 
+bool contains(const UiRect &rect, int16_t x, int16_t y) {
+  return x >= rect.x && x < rect.x + rect.w && y >= rect.y &&
+         y < rect.y + rect.h;
+}
+
 bool isPressed(const Button &button) {
   return button.stableLevel == LOW;
+}
+
+void setStatus(const char *message) {
+  snprintf(statusLine, sizeof(statusLine), "%s", message);
+  uiDirty = true;
 }
 
 void markDirty() {
   uiDirty = true;
   stateDirty = true;
+}
+
+unsigned long elapsedTimeMs() {
+  if (!timerRunning) {
+    return timerAccumulatedMs;
+  }
+  return timerAccumulatedMs + (millis() - timerStartedAt);
+}
+
+String formatElapsedTime(unsigned long elapsedMs) {
+  const unsigned long totalSeconds = elapsedMs / 1000UL;
+  const unsigned long minutes = totalSeconds / 60UL;
+  const unsigned long seconds = totalSeconds % 60UL;
+
+  char buffer[8];
+  snprintf(buffer, sizeof(buffer), "%02lu:%02lu", minutes, seconds);
+  return String(buffer);
 }
 
 const char *pointLabel(const TeamScore &team, const TeamScore &other) {
@@ -120,30 +191,134 @@ String statePayload() {
   return json;
 }
 
+void copyGameLog(char *destination, const char *source) {
+  memcpy(destination, source, MAX_GAME_LOG);
+}
+
+void captureSnapshot(MatchSnapshot &snapshot) {
+  snapshot.teamA = teamA;
+  snapshot.teamB = teamB;
+  snapshot.timerRunning = timerRunning;
+  snapshot.elapsedMs = elapsedTimeMs();
+  snapshot.gameLogCount = gameLogCount;
+  copyGameLog(snapshot.gameLog, gameLog);
+}
+
+void saveUndoState() {
+  captureSnapshot(undoSnapshot);
+  hasUndo = true;
+}
+
+void restoreSnapshot(const MatchSnapshot &snapshot) {
+  teamA = snapshot.teamA;
+  teamB = snapshot.teamB;
+  gameLogCount = snapshot.gameLogCount;
+  copyGameLog(gameLog, snapshot.gameLog);
+
+  timerRunning = snapshot.timerRunning;
+  timerAccumulatedMs = snapshot.elapsedMs;
+  timerStartedAt = timerRunning ? millis() : 0;
+
+  singleClickPending = false;
+  lastButtonReleaseAt = 0;
+  lastRenderedSecond = ~0UL;
+  timerDirty = true;
+  markDirty();
+}
+
+void pushGameLog(char winnerCode) {
+  if (gameLogCount < MAX_GAME_LOG) {
+    gameLog[gameLogCount++] = winnerCode;
+    return;
+  }
+
+  memmove(gameLog, gameLog + 1, MAX_GAME_LOG - 1);
+  gameLog[MAX_GAME_LOG - 1] = winnerCode;
+}
+
 void resetPoints() {
   teamA.points = 0;
   teamB.points = 0;
 }
 
-void resetScores() {
-  teamA.games = 0;
-  teamA.points = 0;
-  teamB.games = 0;
-  teamB.points = 0;
+void resetMatch() {
+  teamA = {0, 0};
+  teamB = {0, 0};
+  gameLogCount = 0;
+  memset(gameLog, 0, sizeof(gameLog));
+  timerRunning = false;
+  timerAccumulatedMs = 0;
+  timerStartedAt = 0;
   singleClickPending = false;
   lastButtonReleaseAt = 0;
+  lastRenderedSecond = ~0UL;
+  timerDirty = true;
+  setStatus("Partit reiniciat");
   markDirty();
 }
 
-void awardPoint(TeamScore &winner, TeamScore &loser) {
+void finishGame(char winnerCode) {
+  if (winnerCode == 'A') {
+    teamA.games++;
+    setStatus("Joc per A");
+  } else {
+    teamB.games++;
+    setStatus("Joc per B");
+  }
+
+  pushGameLog(winnerCode);
+  resetPoints();
+}
+
+void awardPoint(TeamScore &winner, TeamScore &loser, char winnerCode) {
   winner.points++;
 
   if (winner.points >= 4 && (winner.points - loser.points) >= 2) {
-    winner.games++;
-    resetPoints();
+    finishGame(winnerCode);
+  } else {
+    setStatus(winnerCode == 'A' ? "Punt A" : "Punt B");
   }
 
   markDirty();
+}
+
+void handlePointA() {
+  saveUndoState();
+  awardPoint(teamA, teamB, 'A');
+}
+
+void handlePointB() {
+  saveUndoState();
+  awardPoint(teamB, teamA, 'B');
+}
+
+void toggleTimer() {
+  if (timerRunning) {
+    timerAccumulatedMs = elapsedTimeMs();
+    timerRunning = false;
+    timerStartedAt = 0;
+    setStatus("Temps en pausa");
+  } else {
+    timerStartedAt = millis();
+    timerRunning = true;
+    setStatus("Temps en marxa");
+  }
+
+  lastRenderedSecond = ~0UL;
+  timerDirty = true;
+  uiDirty = true;
+}
+
+void undoLastAction() {
+  if (!hasUndo) {
+    setStatus("Cap canvi a desfer");
+    return;
+  }
+
+  const MatchSnapshot snapshot = undoSnapshot;
+  hasUndo = false;
+  restoreSnapshot(snapshot);
+  setStatus("Ultim canvi desfet");
 }
 
 bool updateButton(Button &button) {
@@ -170,7 +345,7 @@ void updateScoreButton() {
   if (updateButton(scoreButton)) {
     const unsigned long now = millis();
     if (singleClickPending && (now - lastButtonReleaseAt <= DOUBLE_CLICK_MS)) {
-      awardPoint(teamB, teamA);
+      handlePointB();
       singleClickPending = false;
       lastButtonReleaseAt = 0;
     } else {
@@ -181,7 +356,7 @@ void updateScoreButton() {
 
   if (singleClickPending && !isPressed(scoreButton) &&
       (millis() - lastButtonReleaseAt > DOUBLE_CLICK_MS)) {
-    awardPoint(teamA, teamB);
+    handlePointA();
     singleClickPending = false;
     lastButtonReleaseAt = 0;
   }
@@ -202,6 +377,34 @@ bool mapTouchToScreen(int16_t &screenX, int16_t &screenY) {
   screenX = constrain(screenX, 0, SCREEN_WIDTH - 1);
   screenY = constrain(screenY, 0, SCREEN_HEIGHT - 1);
   return true;
+}
+
+void handleTouchAction(int16_t screenX, int16_t screenY) {
+  if (contains(TIMER_RECT, screenX, screenY) ||
+      contains(BTN_TIMER_RECT, screenX, screenY)) {
+    toggleTimer();
+    return;
+  }
+
+  if (contains(BTN_UNDO_RECT, screenX, screenY)) {
+    undoLastAction();
+    return;
+  }
+
+  if (contains(STATUS_RECT, screenX, screenY)) {
+    saveUndoState();
+    resetMatch();
+    return;
+  }
+
+  if (contains(BTN_A_RECT, screenX, screenY) || contains(CARD_A_RECT, screenX, screenY)) {
+    handlePointA();
+    return;
+  }
+
+  if (contains(BTN_B_RECT, screenX, screenY) || contains(CARD_B_RECT, screenX, screenY)) {
+    handlePointB();
+  }
 }
 
 void updateTouchInput() {
@@ -225,110 +428,95 @@ void updateTouchInput() {
 
   touchHeld = true;
   lastTouchAt = now;
+  handleTouchAction(screenX, screenY);
+}
 
-  if (screenX < SCREEN_WIDTH / 2) {
-    awardPoint(teamA, teamB);
-    Serial.println("Touch point A");
-  } else {
-    awardPoint(teamB, teamA);
-    Serial.println("Touch point B");
+void drawCenteredText(int16_t centerX, int16_t baselineY, const String &text,
+                      uint16_t color, int font, uint16_t backgroundColor) {
+  tft.setTextColor(color, backgroundColor);
+  tft.drawCentreString(text, centerX, baselineY, font);
+}
+
+void drawTextLine(int16_t x, int16_t y, const String &text, uint16_t color,
+                  int font, uint16_t backgroundColor) {
+  tft.setTextColor(color, backgroundColor);
+  tft.drawString(text, x, y, font);
+}
+
+void drawPill(const UiRect &rect, uint16_t fillColor, uint16_t borderColor) {
+  tft.fillRoundRect(rect.x, rect.y, rect.w, rect.h, 12, fillColor);
+  tft.drawRoundRect(rect.x, rect.y, rect.w, rect.h, 12, borderColor);
+}
+
+void drawButton(const UiRect &rect, uint16_t fillColor, const String &label,
+                int font) {
+  drawPill(rect, fillColor, COLOR_LINE);
+  drawCenteredText(rect.x + rect.w / 2, rect.y + 9, label, COLOR_TEXT, font,
+                   fillColor);
+}
+
+void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &pointValue,
+                   int games, uint16_t accentColor) {
+  const UiRect gamesRect{static_cast<int16_t>(rect.x + 14),
+                         static_cast<int16_t>(rect.y + rect.h - 28),
+                         static_cast<int16_t>(rect.w - 28), 18};
+
+  tft.fillRoundRect(rect.x, rect.y, rect.w, rect.h, 18, COLOR_PANEL);
+  tft.drawRoundRect(rect.x, rect.y, rect.w, rect.h, 18, accentColor);
+
+  tft.fillRoundRect(rect.x + 10, rect.y + 10, rect.w - 20, 22, 10, accentColor);
+  drawCenteredText(rect.x + rect.w / 2, rect.y + 14, teamLabel, COLOR_BG, 2,
+                   accentColor);
+
+  drawCenteredText(rect.x + rect.w / 2, rect.y + 48, pointValue, COLOR_TEXT, 4,
+                   COLOR_PANEL);
+
+  tft.fillRoundRect(gamesRect.x, gamesRect.y, gamesRect.w, gamesRect.h, 8,
+                    COLOR_PANEL_ALT);
+  drawTextLine(gamesRect.x + 10, gamesRect.y + 4, "JOCS", COLOR_MUTED, 1,
+               COLOR_PANEL_ALT);
+  drawTextLine(gamesRect.x + gamesRect.w - 22, gamesRect.y + 2, String(games),
+               COLOR_TEXT, 2, COLOR_PANEL_ALT);
+}
+
+void drawGameLog() {
+  tft.fillRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
+                    COLOR_PANEL);
+  tft.drawRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
+                    COLOR_LINE);
+  drawTextLine(LOG_RECT.x + 10, LOG_RECT.y + 3, "REGISTRE JOCS", COLOR_MUTED, 1,
+               COLOR_PANEL);
+
+  if (gameLogCount == 0) {
+    drawTextLine(LOG_RECT.x + 116, LOG_RECT.y + 10, "encara buit", COLOR_TEXT, 1,
+                 COLOR_PANEL);
+    return;
+  }
+
+  const int16_t chipWidth = 18;
+  const int16_t chipHeight = 14;
+  const int16_t chipGap = 6;
+  const int16_t maxVisible = 9;
+  const int startIndex = gameLogCount > maxVisible ? gameLogCount - maxVisible : 0;
+  int16_t chipX = LOG_RECT.x + 132;
+
+  for (int i = startIndex; i < gameLogCount; ++i) {
+    const char winner = gameLog[i];
+    const uint16_t chipColor = winner == 'A' ? COLOR_A : COLOR_B;
+    UiRect chip{chipX, static_cast<int16_t>(LOG_RECT.y + 8), chipWidth, chipHeight};
+    drawPill(chip, chipColor, chipColor);
+    drawCenteredText(chip.x + chip.w / 2, chip.y + 3, String(winner),
+                     COLOR_BG, 1, chipColor);
+    chipX += chipWidth + chipGap;
   }
 }
 
-struct SegmentMask {
-  char key;
-  uint8_t mask;
-};
-
-constexpr uint8_t SEG_A = 1 << 0;
-constexpr uint8_t SEG_B = 1 << 1;
-constexpr uint8_t SEG_C = 1 << 2;
-constexpr uint8_t SEG_D = 1 << 3;
-constexpr uint8_t SEG_E = 1 << 4;
-constexpr uint8_t SEG_F = 1 << 5;
-constexpr uint8_t SEG_G = 1 << 6;
-
-constexpr SegmentMask SEGMENT_MAP[] = {
-    {'0', SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F},
-    {'1', SEG_B | SEG_C},
-    {'2', SEG_A | SEG_B | SEG_D | SEG_E | SEG_G},
-    {'3', SEG_A | SEG_B | SEG_C | SEG_D | SEG_G},
-    {'4', SEG_B | SEG_C | SEG_F | SEG_G},
-    {'5', SEG_A | SEG_C | SEG_D | SEG_F | SEG_G},
-    {'6', SEG_A | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G},
-    {'7', SEG_A | SEG_B | SEG_C},
-    {'8', SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G},
-    {'9', SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G},
-    {'A', SEG_A | SEG_B | SEG_C | SEG_E | SEG_F | SEG_G},
-    {'b', SEG_C | SEG_D | SEG_E | SEG_F | SEG_G},
-    {'d', SEG_B | SEG_C | SEG_D | SEG_E | SEG_G},
-    {' ', 0},
-};
-
-uint8_t segmentMaskFor(char c) {
-  for (const auto &entry : SEGMENT_MAP) {
-    if (entry.key == c) {
-      return entry.mask;
-    }
-  }
-  return 0;
-}
-
-void drawSegmentDisplay(int16_t x, int16_t y, int16_t w, int16_t h, char value,
-                        uint16_t onColor) {
-  const uint8_t mask = segmentMaskFor(value);
-  const int16_t t = max<int16_t>(4, w / 6);
-  const int16_t vH = (h - 3 * t) / 2;
-  const uint16_t offColor = COLOR_OFF;
-
-  auto horizontal = [&](int16_t sx, int16_t sy, bool on) {
-    tft.fillRoundRect(sx, sy, w - 2 * t, t, t / 2, on ? onColor : offColor);
-  };
-
-  auto vertical = [&](int16_t sx, int16_t sy, bool on) {
-    tft.fillRoundRect(sx, sy, t, vH, t / 2, on ? onColor : offColor);
-  };
-
-  horizontal(x + t, y, mask & SEG_A);
-  vertical(x + w - t, y + t, mask & SEG_B);
-  vertical(x + w - t, y + 2 * t + vH, mask & SEG_C);
-  horizontal(x + t, y + h - t, mask & SEG_D);
-  vertical(x, y + 2 * t + vH, mask & SEG_E);
-  vertical(x, y + t, mask & SEG_F);
-  horizontal(x + t, y + t + vH, mask & SEG_G);
-}
-
-String pointCode(const TeamScore &team, const TeamScore &other) {
-  const char *label = pointLabel(team, other);
-  if (strcmp(label, "0") == 0) {
-    return " 0";
-  }
-  if (strcmp(label, "15") == 0) {
-    return "15";
-  }
-  if (strcmp(label, "30") == 0) {
-    return "30";
-  }
-  if (strcmp(label, "40") == 0) {
-    return "40";
-  }
-  return "Ad";
-}
-
-void drawScorePair(int16_t x, int16_t y, const String &value, uint16_t color,
-                   int16_t cellW, int16_t cellH, int16_t gap) {
-  const char left = value.length() > 0 ? value[0] : ' ';
-  const char right = value.length() > 1 ? value[1] : ' ';
-  drawSegmentDisplay(x, y, cellW, cellH, left, color);
-  drawSegmentDisplay(x + cellW + gap, y, cellW, cellH, right, color);
-}
-
-void drawGamesRow(int16_t x, int16_t y, int value, uint16_t color) {
-  const int capped = constrain(value, 0, 99);
-  const char tens = capped >= 10 ? static_cast<char>('0' + capped / 10) : ' ';
-  const char ones = static_cast<char>('0' + capped % 10);
-  drawSegmentDisplay(x, y, 26, 46, tens, color);
-  drawSegmentDisplay(x + 34, y, 26, 46, ones, color);
+void drawTimerPanel() {
+  drawPill(TIMER_RECT, timerRunning ? COLOR_TIMER : COLOR_PANEL_ALT, COLOR_TIMER);
+  drawCenteredText(TIMER_RECT.x + TIMER_RECT.w / 2, TIMER_RECT.y + 6,
+                   formatElapsedTime(elapsedTimeMs()),
+                   timerRunning ? COLOR_BG : COLOR_TEXT, 2,
+                   timerRunning ? COLOR_TIMER : COLOR_PANEL_ALT);
 }
 
 void renderDisplay() {
@@ -339,20 +527,48 @@ void renderDisplay() {
   tft.startWrite();
   tft.fillScreen(COLOR_BG);
 
-  tft.fillRect(0, 0, SCREEN_WIDTH / 2, SCREEN_HEIGHT, COLOR_A);
-  tft.fillRect(SCREEN_WIDTH / 2, 0, SCREEN_WIDTH / 2, SCREEN_HEIGHT, COLOR_B);
-  tft.drawFastVLine(SCREEN_WIDTH / 2, 0, SCREEN_HEIGHT, COLOR_TEXT);
+  drawPill(STATUS_RECT, COLOR_DANGER, COLOR_DANGER);
+  drawCenteredText(STATUS_RECT.x + STATUS_RECT.w / 2, STATUS_RECT.y + 8,
+                   "RESET", COLOR_TEXT, 1, COLOR_DANGER);
 
-  drawScorePair(18, 42, pointCode(teamA, teamB), COLOR_TEXT, 50, 96, 12);
-  drawScorePair(180, 42, pointCode(teamB, teamA), COLOR_TEXT, 50, 96, 12);
+  drawTimerPanel();
 
-  tft.fillRoundRect(42, 168, 76, 52, 10, COLOR_PANEL);
-  tft.fillRoundRect(202, 168, 76, 52, 10, COLOR_PANEL);
-  drawGamesRow(50, 172, teamA.games, COLOR_TEXT);
-  drawGamesRow(210, 172, teamB.games, COLOR_TEXT);
+  drawPill(BLE_RECT, deviceConnected ? COLOR_SUCCESS : COLOR_PANEL_ALT,
+           deviceConnected ? COLOR_SUCCESS : COLOR_LINE);
+  drawCenteredText(BLE_RECT.x + BLE_RECT.w / 2, BLE_RECT.y + 8,
+                   deviceConnected ? "BLE ON" : "BLE OFF",
+                   deviceConnected ? COLOR_BG : COLOR_TEXT, 1,
+                   deviceConnected ? COLOR_SUCCESS : COLOR_PANEL_ALT);
+
+  drawScoreCard(CARD_A_RECT, "PARELLA A", pointLabel(teamA, teamB), teamA.games,
+                COLOR_A);
+  drawScoreCard(CARD_B_RECT, "PARELLA B", pointLabel(teamB, teamA), teamB.games,
+                COLOR_B);
+
+  drawGameLog();
+
+  drawButton(BTN_A_RECT, COLOR_A, "+A", 2);
+  drawButton(BTN_UNDO_RECT, COLOR_WARNING, "UNDO", 1);
+  drawButton(BTN_TIMER_RECT, timerRunning ? COLOR_TIMER : COLOR_PANEL_ALT,
+             timerRunning ? "PAUSA" : "TEMPS", 1);
+  drawButton(BTN_B_RECT, COLOR_B, "+B", 2);
+
+  drawTextLine(10, 184, statusLine, COLOR_MUTED, 1, COLOR_BG);
+
   tft.endWrite();
-
   uiDirty = false;
+  timerDirty = false;
+}
+
+void renderTimerIfNeeded() {
+  if (!timerDirty || uiDirty) {
+    return;
+  }
+
+  tft.startWrite();
+  drawTimerPanel();
+  tft.endWrite();
+  timerDirty = false;
 }
 
 void publishState() {
@@ -377,7 +593,7 @@ class ScoreServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     deviceConnected = true;
     restartAdvertising = false;
-    uiDirty = true;
+    setStatus("Android connectat");
     stateDirty = true;
     Serial.println("Android connected");
   }
@@ -385,7 +601,7 @@ class ScoreServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) override {
     deviceConnected = false;
     restartAdvertising = true;
-    uiDirty = true;
+    setStatus("Android fora");
     Serial.println("Android disconnected");
   }
 };
@@ -398,21 +614,23 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    const char command = static_cast<char>(toupper(static_cast<unsigned char>(value[0])));
+    const char command =
+        static_cast<char>(toupper(static_cast<unsigned char>(value[0])));
     switch (command) {
       case 'A':
       case '1':
-        awardPoint(teamA, teamB);
+        handlePointA();
         Serial.println("BLE command: point A");
         break;
       case 'B':
       case '2':
-        awardPoint(teamB, teamA);
+        handlePointB();
         Serial.println("BLE command: point B");
         break;
       case 'R':
       case '0':
-        resetScores();
+        saveUndoState();
+        resetMatch();
         Serial.println("BLE command: reset");
         break;
       default:
@@ -491,8 +709,16 @@ void setup() {
 void loop() {
   updateScoreButton();
   updateTouchInput();
+
+  const unsigned long currentSecond = elapsedTimeMs() / 1000UL;
+  if (currentSecond != lastRenderedSecond) {
+    lastRenderedSecond = currentSecond;
+    timerDirty = true;
+  }
+
   publishState();
   renderDisplay();
+  renderTimerIfNeeded();
 
   if (restartAdvertising) {
     BLEDevice::startAdvertising();
