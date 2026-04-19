@@ -5,6 +5,7 @@ Projecte per a `ESP32-C3 SuperMini` amb:
 - `1 boto` integrat `BOOT`
 - connexio `BLE` pensada per `Android`
 - marcador de padel amb `punts` i `jocs`
+- app Android nativa dins [android-app](d:\marcador2\android-app)
 
 ## Funcionament
 
@@ -15,7 +16,7 @@ Projecte per a `ESP32-C3 SuperMini` amb:
 
 ## Bluetooth
 
-El dispositiu anuncia aquest nom:
+L'ESP32 anuncia aquest nom:
 
 - `MarcadorPadel-BLE`
 
@@ -42,7 +43,7 @@ La caracteristica `Command` accepta aquestes ordres:
 
 ## Android
 
-Per provar-ho rapid:
+### Opcio 1: prova rapida amb nRF Connect
 
 1. installa `nRF Connect for Mobile`
 2. busca el dispositiu `MarcadorPadel-BLE`
@@ -51,13 +52,33 @@ Per provar-ho rapid:
 5. activa `Notify` a la caracteristica `State`
 6. escriu `A`, `B` o `R` a la caracteristica `Command`
 
-També tens una app Android nativa dins [android-app](d:\marcador2\android-app):
+### Opcio 2: app Android nativa
+
+L'app Android es troba a [android-app](d:\marcador2\android-app).
+
+Que fa:
+
+- busca automaticament `MarcadorPadel-BLE`
+- es connecta per BLE
+- mostra `punts` i `jocs`
+- envia `Punt A`, `Punt B` i `Reset`
+- rep l'estat per `notify`
+- fa una lectura periodica de suport per evitar que alguns Androids quedin sense refresc en viu
+
+Passos:
 
 1. obre `android-app` amb `Android Studio`
 2. deixa que faci la sincronitzacio de `Gradle`
-3. instal-la l'app al teu telefon Android
+3. instal-la al telefon Android
 4. concedeix permisos de `Bluetooth`
-5. l'app buscara `MarcadorPadel-BLE`, es connectara i et deixara enviar `Punt A`, `Punt B` i `Reset`
+5. encen el marcador BLE
+6. l'app hauria de trobar `MarcadorPadel-BLE` i connectar-s'hi sola
+
+Fitxers principals de l'app:
+
+- UI: [MainActivity.kt](d:\marcador2\android-app\app\src\main\java\com\marcador\padelble\MainActivity.kt)
+- BLE: [ScoreBleManager.kt](d:\marcador2\android-app\app\src\main\java\com\marcador\padelble\ScoreBleManager.kt)
+- estat: [ScoreState.kt](d:\marcador2\android-app\app\src\main\java\com\marcador\padelble\ScoreState.kt)
 
 ## Boto integrat
 
@@ -68,7 +89,7 @@ Per defecte, el projecte fa servir el boto `BOOT` del `ESP32-C3 SuperMini`.
 
 Si prefereixes un boto extern, canvia `SCORE_BUTTON_PIN` a [src/main.cpp](d:\marcador2\src\main.cpp).
 
-## Compilar i pujar
+## Compilar i pujar el firmware
 
 ```bash
 pio run
@@ -76,6 +97,8 @@ pio run -t upload
 pio device monitor
 ```
 
-## Fitxer principal
+## Fitxers principals
 
-La logica principal es a [src/main.cpp](d:\marcador2\src\main.cpp).
+- firmware ESP32: [src/main.cpp](d:\marcador2\src\main.cpp)
+- configuracio PlatformIO: [platformio.ini](d:\marcador2\platformio.ini)
+- app Android: [android-app](d:\marcador2\android-app)
