@@ -50,7 +50,7 @@ constexpr uint16_t COLOR_WARNING = 0xF2A6;
 constexpr uint16_t COLOR_DANGER = 0xE186;
 
 constexpr uint8_t MAX_GAME_LOG = 10;
-constexpr uint8_t MAX_SET_HISTORY = 3;
+constexpr uint8_t MAX_SET_HISTORY = 5;
 
 struct Button {
   uint8_t pin;
@@ -72,9 +72,13 @@ enum class ScreenMode {
 
 enum class SportId {
   Padel,
+  Tennis,
   Football,
   Basketball,
   Paret,
+  Volleyball,
+  Handball,
+  PingPong,
 };
 
 struct UiRect {
@@ -87,6 +91,7 @@ struct UiRect {
 struct MatchSnapshot {
   TeamScore teamA;
   TeamScore teamB;
+  uint8_t periodNumber;
   bool timerRunning;
   unsigned long elapsedMs;
   uint8_t gameLogCount;
@@ -112,6 +117,7 @@ constexpr UiRect HOME_PADEL_RECT{10, 62, 145, 64};
 constexpr UiRect HOME_FOOTBALL_RECT{165, 62, 145, 64};
 constexpr UiRect HOME_BASKET_RECT{10, 142, 145, 64};
 constexpr UiRect HOME_PARET_RECT{165, 142, 145, 64};
+constexpr UiRect HOME_NAV_RECT{10, 214, 300, 18};
 
 TFT_eSPI tft = TFT_eSPI();
 SPIClass touchSpi(VSPI);
@@ -122,6 +128,7 @@ TeamScore teamA{0, 0, 0};
 TeamScore teamB{0, 0, 0};
 ScreenMode currentScreen = ScreenMode::Home;
 SportId currentSport = SportId::Padel;
+uint8_t homePage = 0;
 
 bool singleClickPending = false;
 unsigned long lastButtonReleaseAt = 0;
@@ -141,6 +148,7 @@ uint8_t gameLogCount = 0;
 uint8_t setHistoryCount = 0;
 uint8_t setScoresA[MAX_SET_HISTORY] = {};
 uint8_t setScoresB[MAX_SET_HISTORY] = {};
+uint8_t periodNumber = 1;
 char statusLine[24] = "";
 
 BLECharacteristic *stateCharacteristic = nullptr;
@@ -151,12 +159,20 @@ const char *sportName() {
   switch (currentSport) {
     case SportId::Padel:
       return "PADEL";
+    case SportId::Tennis:
+      return "TENNIS";
     case SportId::Football:
       return "FUTBOL";
     case SportId::Basketball:
       return "BASQUET";
     case SportId::Paret:
       return "PARET";
+    case SportId::Volleyball:
+      return "VOLEI";
+    case SportId::Handball:
+      return "HANDBOL";
+    case SportId::PingPong:
+      return "PING-PONG";
   }
   return "";
 }
@@ -165,8 +181,24 @@ bool isPadelSport() {
   return currentSport == SportId::Padel;
 }
 
+bool isSetRacketSport() {
+  return currentSport == SportId::Padel || currentSport == SportId::Tennis;
+}
+
 bool isParetSport() {
   return currentSport == SportId::Paret;
+}
+
+bool isSetPointSport() {
+  return currentSport == SportId::Volleyball || currentSport == SportId::PingPong;
+}
+
+bool isAnySetSport() {
+  return isSetRacketSport() || isSetPointSport();
+}
+
+bool isPeriodSport() {
+  return currentSport == SportId::Basketball || currentSport == SportId::Handball;
 }
 
 bool contains(const UiRect &rect, int16_t x, int16_t y) {
@@ -183,8 +215,12 @@ bool matchOver() {
     return false;
   }
 
-  if (isPadelSport()) {
+  if (isSetRacketSport()) {
     return teamA.sets >= 2 || teamB.sets >= 2;
+  }
+
+  if (isSetPointSport()) {
+    return teamA.sets >= 3 || teamB.sets >= 3;
   }
 
   if (isParetSport()) {
@@ -195,7 +231,7 @@ bool matchOver() {
 }
 
 bool inTieBreak() {
-  return currentScreen == ScreenMode::Match && isPadelSport() && !matchOver() &&
+  return currentScreen == ScreenMode::Match && isSetRacketSport() && !matchOver() &&
          teamA.games == 6 && teamB.games == 6;
 }
 
@@ -233,7 +269,7 @@ String formatElapsedTime(unsigned long elapsedMs) {
 
 String pointLabel(const TeamScore &team, const TeamScore &other) {
   if (matchOver()) {
-    if (isPadelSport()) {
+    if (isAnySetSport()) {
       return team.sets > other.sets ? "WIN" : "--";
     }
     if (isParetSport()) {
@@ -241,7 +277,7 @@ String pointLabel(const TeamScore &team, const TeamScore &other) {
     }
   }
 
-  if (!isPadelSport()) {
+  if (!isSetRacketSport()) {
     return String(team.points);
   }
 
@@ -316,6 +352,7 @@ void copyGameLog(char *destination, const char *source) {
 void captureSnapshot(MatchSnapshot &snapshot) {
   snapshot.teamA = teamA;
   snapshot.teamB = teamB;
+  snapshot.periodNumber = periodNumber;
   snapshot.timerRunning = timerRunning;
   snapshot.elapsedMs = elapsedTimeMs();
   snapshot.gameLogCount = gameLogCount;
@@ -333,6 +370,7 @@ void saveUndoState() {
 void restoreSnapshot(const MatchSnapshot &snapshot) {
   teamA = snapshot.teamA;
   teamB = snapshot.teamB;
+  periodNumber = snapshot.periodNumber;
   gameLogCount = snapshot.gameLogCount;
   copyGameLog(gameLog, snapshot.gameLog);
   setHistoryCount = snapshot.setHistoryCount;
@@ -375,6 +413,7 @@ void resetGamesAndPoints() {
 void resetMatch() {
   teamA = {0, 0, 0};
   teamB = {0, 0, 0};
+  periodNumber = 1;
   gameLogCount = 0;
   memset(gameLog, 0, sizeof(gameLog));
   setHistoryCount = 0;
@@ -406,6 +445,9 @@ void startSport(SportId sport) {
     case SportId::Padel:
       setStatus("Padel llest");
       break;
+    case SportId::Tennis:
+      setStatus("Tennis llest");
+      break;
     case SportId::Football:
       setStatus("Futbol llest");
       break;
@@ -415,6 +457,15 @@ void startSport(SportId sport) {
     case SportId::Paret:
       setStatus("Paret llest");
       break;
+    case SportId::Volleyball:
+      setStatus("Volei llest");
+      break;
+    case SportId::Handball:
+      setStatus("Handbol llest");
+      break;
+    case SportId::PingPong:
+      setStatus("Ping-pong llest");
+      break;
   }
 
   lastRenderedSecond = ~0UL;
@@ -422,18 +473,19 @@ void startSport(SportId sport) {
   uiDirty = true;
 }
 
-void recordSetResult() {
+void recordSetResult(uint8_t scoreA, uint8_t scoreB) {
   if (setHistoryCount >= MAX_SET_HISTORY) {
     return;
   }
 
-  setScoresA[setHistoryCount] = static_cast<uint8_t>(teamA.games);
-  setScoresB[setHistoryCount] = static_cast<uint8_t>(teamB.games);
+  setScoresA[setHistoryCount] = scoreA;
+  setScoresB[setHistoryCount] = scoreB;
   setHistoryCount++;
 }
 
 void concludeSet(char winnerCode) {
-  recordSetResult();
+  recordSetResult(static_cast<uint8_t>(teamA.games),
+                  static_cast<uint8_t>(teamB.games));
 
   if (winnerCode == 'A') {
     teamA.sets++;
@@ -448,6 +500,23 @@ void concludeSet(char winnerCode) {
   if (!matchOver()) {
     teamA.games = 0;
     teamB.games = 0;
+  }
+}
+
+void concludePointSet(char winnerCode) {
+  recordSetResult(static_cast<uint8_t>(teamA.points),
+                  static_cast<uint8_t>(teamB.points));
+
+  if (winnerCode == 'A') {
+    teamA.sets++;
+    setStatus(teamA.sets >= 3 ? "Partit per A" : "Set per A");
+  } else {
+    teamB.sets++;
+    setStatus(teamB.sets >= 3 ? "Partit per B" : "Set per B");
+  }
+
+  if (!matchOver()) {
+    resetPoints();
   }
 }
 
@@ -497,10 +566,61 @@ void awardPoint(TeamScore &winner, TeamScore &loser, char winnerCode) {
   markDirty();
 }
 
+void awardSetPoint(TeamScore &winner, TeamScore &loser, char winnerCode) {
+  if (matchOver()) {
+    setStatus("Partit acabat");
+    uiDirty = true;
+    return;
+  }
+
+  winner.points++;
+  const int target =
+      currentSport == SportId::Volleyball ? (setHistoryCount >= 4 ? 15 : 25) : 11;
+
+  if (winner.points >= target && (winner.points - loser.points) >= 2) {
+    concludePointSet(winnerCode);
+  } else {
+    if (currentSport == SportId::Volleyball) {
+      setStatus(winnerCode == 'A' ? "Punt volei A" : "Punt volei B");
+    } else {
+      setStatus(winnerCode == 'A' ? "Punt ping A" : "Punt ping B");
+    }
+  }
+
+  markDirty();
+}
+
+void advancePeriod() {
+  if (currentSport == SportId::Basketball) {
+    if (periodNumber < 4) {
+      periodNumber++;
+      setStatus(periodNumber == 4 ? "Ultim quart" : "Seguent quart");
+    } else {
+      setStatus("Ja ets al Q4");
+    }
+  } else if (currentSport == SportId::Handball) {
+    if (periodNumber < 2) {
+      periodNumber++;
+      setStatus("Segona part");
+    } else {
+      setStatus("Ja ets a 2a part");
+    }
+  } else {
+    return;
+  }
+
+  markDirty();
+}
+
 void handlePointA() {
   saveUndoState();
-  if (isPadelSport()) {
+  if (isSetRacketSport()) {
     awardPoint(teamA, teamB, 'A');
+    return;
+  }
+
+  if (isSetPointSport()) {
+    awardSetPoint(teamA, teamB, 'A');
     return;
   }
 
@@ -514,14 +634,21 @@ void handlePointA() {
   }
 
   teamA.points++;
-  setStatus(currentSport == SportId::Football ? "Gol A" : "Punts A");
+  setStatus((currentSport == SportId::Football || currentSport == SportId::Handball)
+                ? "Gol A"
+                : "Punts A");
   markDirty();
 }
 
 void handlePointB() {
   saveUndoState();
-  if (isPadelSport()) {
+  if (isSetRacketSport()) {
     awardPoint(teamB, teamA, 'B');
+    return;
+  }
+
+  if (isSetPointSport()) {
+    awardSetPoint(teamB, teamA, 'B');
     return;
   }
 
@@ -535,7 +662,9 @@ void handlePointB() {
   }
 
   teamB.points++;
-  setStatus(currentSport == SportId::Football ? "Gol B" : "Punts B");
+  setStatus((currentSport == SportId::Football || currentSport == SportId::Handball)
+                ? "Gol B"
+                : "Punts B");
   markDirty();
 }
 
@@ -628,14 +757,29 @@ bool mapTouchToScreen(int16_t &screenX, int16_t &screenY) {
 
 void handleTouchAction(int16_t screenX, int16_t screenY) {
   if (currentScreen == ScreenMode::Home) {
-    if (contains(HOME_PADEL_RECT, screenX, screenY)) {
-      startSport(SportId::Padel);
-    } else if (contains(HOME_FOOTBALL_RECT, screenX, screenY)) {
-      startSport(SportId::Football);
-    } else if (contains(HOME_BASKET_RECT, screenX, screenY)) {
-      startSport(SportId::Basketball);
-    } else if (contains(HOME_PARET_RECT, screenX, screenY)) {
-      startSport(SportId::Paret);
+    if (contains(HOME_NAV_RECT, screenX, screenY)) {
+      homePage = homePage == 0 ? 1 : 0;
+      uiDirty = true;
+    } else if (homePage == 0) {
+      if (contains(HOME_PADEL_RECT, screenX, screenY)) {
+        startSport(SportId::Padel);
+      } else if (contains(HOME_FOOTBALL_RECT, screenX, screenY)) {
+        startSport(SportId::Tennis);
+      } else if (contains(HOME_BASKET_RECT, screenX, screenY)) {
+        startSport(SportId::Football);
+      } else if (contains(HOME_PARET_RECT, screenX, screenY)) {
+        startSport(SportId::Basketball);
+      }
+    } else {
+      if (contains(HOME_PADEL_RECT, screenX, screenY)) {
+        startSport(SportId::Paret);
+      } else if (contains(HOME_FOOTBALL_RECT, screenX, screenY)) {
+        startSport(SportId::Volleyball);
+      } else if (contains(HOME_BASKET_RECT, screenX, screenY)) {
+        startSport(SportId::Handball);
+      } else if (contains(HOME_PARET_RECT, screenX, screenY)) {
+        startSport(SportId::PingPong);
+      }
     }
     return;
   }
@@ -651,6 +795,11 @@ void handleTouchAction(int16_t screenX, int16_t screenY) {
     return;
   }
 
+  if (contains(STATUS_MSG_RECT, screenX, screenY)) {
+    goHome();
+    return;
+  }
+
   if (contains(STATUS_RECT, screenX, screenY)) {
     saveUndoState();
     resetMatch();
@@ -658,7 +807,12 @@ void handleTouchAction(int16_t screenX, int16_t screenY) {
   }
 
   if (contains(LOG_RECT, screenX, screenY)) {
-    goHome();
+    if (isPeriodSport()) {
+      saveUndoState();
+      advancePeriod();
+    } else {
+      goHome();
+    }
     return;
   }
 
@@ -759,7 +913,7 @@ void drawSportTile(const UiRect &rect, uint16_t fillColor, const String &title,
 }
 
 void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &pointValue,
-                   int games, int sets, uint16_t accentColor) {
+                   int rawPoints, int games, int sets, uint16_t accentColor) {
   const UiRect gamesRect{static_cast<int16_t>(rect.x + 14),
                          static_cast<int16_t>(rect.y + rect.h - 28),
                          static_cast<int16_t>(rect.w - 28), 18};
@@ -777,24 +931,26 @@ void drawScoreCard(const UiRect &rect, const char *teamLabel, const String &poin
   drawCenteredText(rect.x + rect.w / 2, bigValueY, pointValue, pointColor, bigFont,
                    COLOR_PANEL);
 
-  if (isPadelSport()) {
+  if (isAnySetSport()) {
     tft.fillRoundRect(gamesRect.x, gamesRect.y, gamesRect.w, gamesRect.h, 8,
                       COLOR_PANEL_ALT);
     drawCenteredText(gamesRect.x + 28, gamesRect.y + 3, "SETS", COLOR_MUTED, 1,
                      COLOR_PANEL_ALT);
     drawCenteredText(gamesRect.x + 28, gamesRect.y + 11, String(sets), COLOR_TEXT, 2,
                      COLOR_PANEL_ALT);
-    drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 3, "JOCS",
+    drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 3,
+                     isSetRacketSport() ? "JOCS" : "PUNTS",
                      COLOR_MUTED, 1, COLOR_PANEL_ALT);
     drawCenteredText(gamesRect.x + gamesRect.w - 28, gamesRect.y + 11,
-                     String(games), COLOR_TEXT, 2, COLOR_PANEL_ALT);
+                     String(isSetRacketSport() ? games : rawPoints), COLOR_TEXT, 2,
+                     COLOR_PANEL_ALT);
     return;
   }
 
   tft.fillRoundRect(gamesRect.x + 20, gamesRect.y, gamesRect.w - 40, gamesRect.h, 8,
                     COLOR_PANEL_ALT);
   drawCenteredText(rect.x + rect.w / 2, gamesRect.y + 7,
-                   currentSport == SportId::Football
+                   (currentSport == SportId::Football || currentSport == SportId::Handball)
                        ? "GOLS"
                        : (currentSport == SportId::Paret ? "VIDES" : "PUNTS"),
                    COLOR_MUTED, 1, COLOR_PANEL_ALT);
@@ -818,15 +974,25 @@ String setsSummary() {
 }
 
 void drawMatchStrip() {
-  if (!isPadelSport()) {
+  if (!isAnySetSport()) {
     tft.fillRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
                       COLOR_PANEL);
     tft.drawRoundRect(LOG_RECT.x, LOG_RECT.y, LOG_RECT.w, LOG_RECT.h, 14,
                       COLOR_LINE);
     drawTextLine(LOG_RECT.x + 10, LOG_RECT.y + 11, sportName(), COLOR_TEXT, 1,
                  COLOR_PANEL);
-    drawTextLine(LOG_RECT.x + 168, LOG_RECT.y + 11, "toca per canviar",
-                 COLOR_MUTED, 1, COLOR_PANEL);
+    if (currentSport == SportId::Basketball) {
+      drawTextLine(LOG_RECT.x + 154, LOG_RECT.y + 11,
+                   String("Q") + String(periodNumber) + "  toca per avancar",
+                   COLOR_MUTED, 1, COLOR_PANEL);
+    } else if (currentSport == SportId::Handball) {
+      drawTextLine(LOG_RECT.x + 134, LOG_RECT.y + 11,
+                   String(periodNumber) + "a part  toca per avancar",
+                   COLOR_MUTED, 1, COLOR_PANEL);
+    } else {
+      drawTextLine(LOG_RECT.x + 168, LOG_RECT.y + 11, "toca per canviar",
+                   COLOR_MUTED, 1, COLOR_PANEL);
+    }
     return;
   }
 
@@ -868,10 +1034,23 @@ void renderHomeScreen() {
                    HOME_SUBTITLE_RECT.y + 2, "toca per obrir el marcador",
                    COLOR_MUTED, 1, COLOR_BG);
 
-  drawSportTile(HOME_PADEL_RECT, COLOR_A, "PADEL", "punts, jocs i sets");
-  drawSportTile(HOME_FOOTBALL_RECT, COLOR_B, "FUTBOL", "marcador directe");
-  drawSportTile(HOME_BASKET_RECT, COLOR_TIMER, "BASQUET", "marcador directe");
-  drawSportTile(HOME_PARET_RECT, COLOR_SUCCESS, "PARET", "5 vides per costat");
+  if (homePage == 0) {
+    drawSportTile(HOME_PADEL_RECT, COLOR_A, "PADEL", "punts, jocs i sets");
+    drawSportTile(HOME_FOOTBALL_RECT, COLOR_B, "TENNIS", "sets i tie-break");
+    drawSportTile(HOME_BASKET_RECT, COLOR_TIMER, "FUTBOL", "marcador directe");
+    drawSportTile(HOME_PARET_RECT, COLOR_WARNING, "BASQUET", "quarts");
+  } else {
+    drawSportTile(HOME_PADEL_RECT, COLOR_SUCCESS, "PARET", "5 vides per costat");
+    drawSportTile(HOME_FOOTBALL_RECT, COLOR_A, "VOLEI", "sets a 25");
+    drawSportTile(HOME_BASKET_RECT, COLOR_B, "HANDBOL", "parts");
+    drawSportTile(HOME_PARET_RECT, COLOR_TIMER, "PING-PONG", "sets a 11");
+  }
+
+  drawPill(HOME_NAV_RECT, COLOR_PANEL_ALT, COLOR_LINE);
+  drawCenteredText(HOME_NAV_RECT.x + HOME_NAV_RECT.w / 2, HOME_NAV_RECT.y + 4,
+                   homePage == 0 ? "pagina 1/2  toca per mes"
+                                 : "pagina 2/2  toca per tornar",
+                   COLOR_MUTED, 1, COLOR_PANEL_ALT);
 
   tft.endWrite();
   uiDirty = false;
@@ -906,11 +1085,11 @@ void renderDisplay() {
   drawTimerPanel();
   drawStatusPanel();
 
-  drawScoreCard(CARD_A_RECT, isPadelSport() ? "PARELLA A" : "EQUIP A",
-                pointLabel(teamA, teamB), teamA.games,
+  drawScoreCard(CARD_A_RECT, isSetRacketSport() ? "PARELLA A" : "EQUIP A",
+                pointLabel(teamA, teamB), teamA.points, teamA.games,
                 teamA.sets, COLOR_A);
-  drawScoreCard(CARD_B_RECT, isPadelSport() ? "PARELLA B" : "EQUIP B",
-                pointLabel(teamB, teamA), teamB.games,
+  drawScoreCard(CARD_B_RECT, isSetRacketSport() ? "PARELLA B" : "EQUIP B",
+                pointLabel(teamB, teamA), teamB.points, teamB.games,
                 teamB.sets, COLOR_B);
 
   drawMatchStrip();
